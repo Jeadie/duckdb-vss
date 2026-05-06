@@ -67,11 +67,16 @@ static unique_ptr<GlobalTableFunctionState> HNSWIndexScanInitGlobal(ClientContex
 	result->local_storage_state.Initialize(result->column_ids, context, input.filters);
 	local_storage.InitializeScan(bind_data.table.GetStorage(), result->local_storage_state.local_state, input.filters);
 
-	// Build filter bitmap if filters were pushed down by the optimizer
-	if (bind_data.pushed_filters && !bind_data.pushed_filters->filters.empty()) {
-		result->filter_bitmap =
-		    BuildFilterBitmap(context, bind_data.table, *bind_data.pushed_filters,
-		                      bind_data.filter_logical_col_ids, bind_data.filter_col_types);
+	// Build filter bitmap if table_filters or computed LogicalFilter expressions were pushed down
+	const bool has_table_filters =
+	    bind_data.pushed_filters && !bind_data.pushed_filters->filters.empty();
+	const bool has_extra_exprs = !bind_data.pushed_filter_expressions.empty();
+	if (has_table_filters || has_extra_exprs) {
+		const TableFilterSet *tfs = has_table_filters ? bind_data.pushed_filters.get() : nullptr;
+		const auto *extra = has_extra_exprs ? &bind_data.pushed_filter_expressions : nullptr;
+		result->filter_bitmap = BuildFilterBitmap(context, bind_data.table, tfs,
+		                                          bind_data.filter_logical_col_ids,
+		                                          bind_data.filter_col_types, extra);
 	}
 
 	// Initialize the scan state for the index (pass bitmap when available)

@@ -8,6 +8,7 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_index.hpp"
 
@@ -37,6 +38,11 @@ struct HNSWIndexScanBindData final : public TableScanBindData {
 	vector<idx_t>        filter_logical_col_ids;  // logical col IDs (keys in pushed_filters->filters)
 	vector<StorageIndex> filter_storage_col_ids;  // storage col IDs (for DataTable scan)
 	vector<LogicalType>  filter_col_types;
+
+	//! Pre-remapped LogicalFilter expressions (BoundReferenceExpression, chunk-position indexed).
+	//! Column at position i in filter_logical_col_ids maps to BoundReferenceExpression(type, i).
+	//! Combined AND'd with table_filter-derived expressions in BuildFilterBitmap.
+	vector<unique_ptr<Expression>> pushed_filter_expressions;
 
 public:
 	bool Equals(const FunctionData &other_p) const override {

@@ -169,3 +169,79 @@ ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]);
 50
 90
 10
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 9. Computed-only predicate: lower(label) = 'a'
+#    DuckDB does NOT push this into table_filters; it stays as a LogicalFilter node.
+#    The HNSW optimizer must detect and push it via pushed_filter_expressions.
+# ───────────────────────────────────────────────────────────────────────────────
+
+statement ok
+SET hnsw_enable_filter_pushdown = true;
+
+# Plan shape: HNSW_INDEX_SCAN with no FILTER node above it (LogicalFilter consumed)
+query II
+EXPLAIN SELECT id FROM flt WHERE lower(label) = 'a'
+ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+
+# Returns exactly LIMIT rows — bitmap pre-filter prevents underfill
+query I
+SELECT count(*) FROM (
+    SELECT id FROM flt WHERE lower(label) = 'a'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# All returned rows satisfy the predicate (no wrong results)
+query I
+SELECT count(*) FROM (
+    SELECT id, label FROM flt WHERE lower(label) = 'a'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+) WHERE lower(label) != 'a';
+----
+0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 10. Mixed: table_filter (id >= 50) AND computed predicate (lower(label) = 'a')
+#     Both filters are pushed: table_filter into pushed_filters (zone-map pruning),
+#     computed predicate into pushed_filter_expressions.
+# ───────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM (
+    SELECT id, label FROM flt
+    WHERE id >= 50 AND lower(label) = 'a'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# No rows with id < 50 or wrong label
+query I
+SELECT count(*) FROM (
+    SELECT id, label FROM flt
+    WHERE id >= 50 AND lower(label) = 'a'
+    ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
+) WHERE id < 50 OR lower(label) != 'a';
+----
+0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 11. Escape hatch with a computed predicate:
+#     SET hnsw_enable_filter_pushdown = false must still produce a FILTER node.
+# ───────────────────────────────────────────────────────────────────────────────
+
+statement ok
+SET hnsw_enable_filter_pushdown = false;
+
+query II
+EXPLAIN SELECT id FROM flt WHERE lower(label) = 'a'
+ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*FILTER.*
+
+statement ok
+SET hnsw_enable_filter_pushdown = true;

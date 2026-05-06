@@ -7,6 +7,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -24,17 +25,22 @@ static void MarkMatchingRows(ExpressionExecutor &executor, DataChunk &chunk, Sel
 	idx_t valid_count = executor.SelectExpression(chunk, sel);
 
 	auto &row_id_vec = chunk.data[filter_col_count]; // last column = row_id
+	// The row_id column is typically a SequenceVector synthesized by the storage engine.
+	// FlatVector::GetData reads raw backing memory, which is wrong for non-flat vectors.
+	// Flatten materializes the sequence in-place before we index into it.
+	row_id_vec.Flatten(chunk.size());
 	auto row_ids_ptr = FlatVector::GetData<row_t>(row_id_vec);
+
 	for (idx_t i = 0; i < valid_count; i++) {
 		bitmap.Set(row_ids_ptr[sel.get_index(i)]);
 	}
 }
 
 unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogEntry &table,
-                                           const TableFilterSet &filters,
+                                           const TableFilterSet *filters,
                                            const vector<idx_t> &logical_col_ids,
-                                           const vector<LogicalType> &col_types) {
-	D_ASSERT(!filters.filters.empty());
+                                           const vector<LogicalType> &col_types,
+                                           const vector<unique_ptr<Expression>> *extra_exprs) {
 	D_ASSERT(logical_col_ids.size() == col_types.size());
 
 	auto &storage = table.GetStorage();
@@ -64,19 +70,38 @@ unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogE
 	// than the original logical column ID.  This is critical: after scanning, chunk columns
 	// are laid out at positions 0..n-1, independent of the source table's column numbering.
 	vector<unique_ptr<Expression>> filter_exprs;
-	filter_exprs.reserve(filters.filters.size());
-	for (idx_t i = 0; i < logical_col_ids.size(); i++) {
-		idx_t orig_col_id = logical_col_ids[i];
-		auto it = filters.filters.find(orig_col_id);
-		if (it == filters.filters.end()) {
-			continue;
+
+	// 1. Table-filter-derived expressions (converted from TableFilterSet, for zone-map tables).
+	// IMPORTANT: Skip OPTIONAL_FILTER entries — they are hints for zone-map row-group pruning
+	// only and are NOT guaranteed to be correct for row-level evaluation.  DuckDB wraps e.g.
+	// id IN (10, 50, 90) in an OptionalFilter because the LogicalFilter expression
+	// (id=10 OR id=50 OR id=90) is the authoritative row-level predicate.  Including the
+	// OptionalFilter expression here would produce wrong bitmap marks.
+	if (filters && !filters->filters.empty()) {
+		filter_exprs.reserve(filters->filters.size());
+		for (idx_t i = 0; i < logical_col_ids.size(); i++) {
+			idx_t orig_col_id = logical_col_ids[i];
+			auto it = filters->filters.find(orig_col_id);
+			if (it == filters->filters.end()) {
+				continue;
+			}
+			if (it->second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue; // zone-map only — not safe for row-level evaluation
+			}
+			auto col_ref = make_uniq<BoundReferenceExpression>(col_types[i], i);
+			filter_exprs.push_back(it->second->ToExpression(*col_ref));
 		}
-		auto col_ref = make_uniq<BoundReferenceExpression>(col_types[i], i);
-		filter_exprs.push_back(it->second->ToExpression(*col_ref));
+	}
+
+	// 2. Pre-remapped LogicalFilter expressions (already use BoundReferenceExpression)
+	if (extra_exprs) {
+		for (const auto &expr : *extra_exprs) {
+			filter_exprs.push_back(expr->Copy());
+		}
 	}
 
 	if (filter_exprs.empty()) {
-		// No evaluable filters (shouldn't normally happen given the caller's guard)
+		// No evaluable filters; bitmap remains all-false (caller should not reach this normally)
 		return bitmap;
 	}
 
@@ -97,25 +122,38 @@ unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogE
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), scan_types);
 
-	// Build a POSITION-remapped TableFilterSet for zone-map pruning.
-	// ScanFilterInfo::Initialize treats filter keys as indices into scan_col_ids, NOT logical col IDs.
-	// We scan with [label_storage_col, row_id], so label is at scan position 0, not logical position 1.
+	// Build a POSITION-remapped TableFilterSet for zone-map pruning (only when MANDATORY table
+	// filters are present).  ScanFilterInfo::Initialize treats filter keys as indices into
+	// scan_col_ids, NOT logical col IDs.
+	//
+	// IMPORTANT: Exclude OptionalFilter from zone_map_filters — if the scan engine applies an
+	// OptionalFilter at the row level during Scan(), it compacts the output chunk, which offsets
+	// the row_id indices used in MarkMatchingRows and produces wrong bitmap marks.  OptionalFilters
+	// are safe for row-group skipping only; our ExpressionExecutor handles row-level filtering.
 	TableFilterSet remapped_filters;
-	for (idx_t i = 0; i < logical_col_ids.size(); i++) {
-		idx_t orig_col_id = logical_col_ids[i];
-		auto it = filters.filters.find(orig_col_id);
-		if (it != filters.filters.end()) {
+	if (filters && !filters->filters.empty()) {
+		for (idx_t i = 0; i < logical_col_ids.size(); i++) {
+			idx_t orig_col_id = logical_col_ids[i];
+			auto it = filters->filters.find(orig_col_id);
+			if (it == filters->filters.end()) {
+				continue;
+			}
+			if (it->second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue; // not safe to pass as zone_map_filters — can corrupt row-level scan
+			}
 			remapped_filters.filters.emplace(i, it->second->Copy());
 		}
 	}
+	optional_ptr<TableFilterSet> zone_map_filters = remapped_filters.filters.empty()
+	                                                     ? optional_ptr<TableFilterSet>()
+	                                                     : optional_ptr<TableFilterSet>(&remapped_filters);
 
 	// --- Scan main (committed) storage ---
-	// Passing the remapped TableFilterSet enables zone-map pruning (row-group skipping).
+	// Passing zone_map_filters enables row-group skipping when table_filters are present.
 	// Row-level filtering is applied via ExpressionExecutor above.
 	{
 		TableScanState scan_state;
-		storage.InitializeScan(context, transaction, scan_state, scan_col_ids,
-		                       optional_ptr<TableFilterSet>(&remapped_filters));
+		storage.InitializeScan(context, transaction, scan_state, scan_col_ids, zone_map_filters);
 
 		while (true) {
 			chunk.Reset();
@@ -136,8 +174,7 @@ unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogE
 		if (local_storage.Find(storage)) {
 			// TableScanState acts as the required parent for local_state (CollectionScanState).
 			TableScanState local_ts;
-			local_storage.InitializeScan(storage, local_ts.local_state,
-			                             optional_ptr<TableFilterSet>(&remapped_filters));
+			local_storage.InitializeScan(storage, local_ts.local_state, zone_map_filters);
 
 			DataChunk local_chunk;
 			local_chunk.Initialize(Allocator::Get(context), scan_types);
@@ -150,6 +187,7 @@ unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogE
 				}
 				// Local storage row_ids may exceed the pre-allocated bitmap size; grow dynamically.
 				auto &row_id_vec = local_chunk.data[filter_col_count];
+				row_id_vec.Flatten(local_chunk.size());
 				auto row_ids_ptr = FlatVector::GetData<row_t>(row_id_vec);
 				idx_t valid_count = executor.SelectExpression(local_chunk, sel);
 				for (idx_t i = 0; i < valid_count; i++) {

@@ -4,6 +4,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_index.hpp"
 
@@ -40,13 +41,18 @@ struct FilterBitmap {
 };
 
 //! Scan the filter columns of `table` for all transaction-visible rows that
-//! satisfy `filters` and mark their row_ids in the returned bitmap.
+//! satisfy `filters` and/or `extra_exprs` and mark their row_ids in the returned bitmap.
 //!
-//! @param logical_col_ids  Logical column indices that are keys in filters.filters
-//! @param col_types        Types of those columns (positionally aligned)
+//! @param filters          Optional TableFilterSet for zone-map pruning (may be null for
+//!                         computed-only predicates that have no table_filters).
+//! @param logical_col_ids  Logical column indices to scan (covers both filters and extra_exprs).
+//! @param col_types        Types of those columns (positionally aligned with logical_col_ids).
+//! @param extra_exprs      Optional pre-remapped LogicalFilter expressions
+//!                         (BoundReferenceExpression, indexed by position in logical_col_ids).
 unique_ptr<FilterBitmap> BuildFilterBitmap(ClientContext &context, TableCatalogEntry &table,
-                                           const TableFilterSet &filters,
+                                           const TableFilterSet *filters,
                                            const vector<idx_t> &logical_col_ids,
-                                           const vector<LogicalType> &col_types);
+                                           const vector<LogicalType> &col_types,
+                                           const vector<unique_ptr<Expression>> *extra_exprs = nullptr);
 
 } // namespace duckdb

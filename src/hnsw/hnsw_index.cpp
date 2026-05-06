@@ -352,6 +352,7 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 	state->row_ids = make_uniq_array<row_t>(search_result.size());
 
 	search_result.dump_to(state->row_ids.get());
+
 	return std::move(state);
 }
 

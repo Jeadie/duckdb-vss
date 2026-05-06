@@ -1,7 +1,11 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -17,6 +21,46 @@
 #include "hnsw/hnsw_index_scan.hpp"
 
 namespace duckdb {
+
+//-----------------------------------------------------------------------------
+// Helpers
+//-----------------------------------------------------------------------------
+
+//! Returns true iff every node in the expression tree is safe to evaluate by a
+//! standalone ExpressionExecutor against a plain DataChunk (no operator context).
+//! Rejects subqueries and column refs that don't come from the given LogicalGet.
+static bool IsExpressionSafeForPushdown(const Expression &expr, idx_t table_index,
+                                        const vector<ColumnIndex> &col_ids) {
+	// Subqueries require a full query-execution context — cannot evaluate standalone
+	if (expr.expression_class == ExpressionClass::BOUND_SUBQUERY) {
+		return false;
+	}
+	if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+		// Must reference the HNSW table (not an outer or joined table)
+		if (col_ref.binding.table_index != table_index) {
+			return false;
+		}
+		// Binding index must be a valid projection position
+		if (col_ref.binding.column_index >= col_ids.size()) {
+			return false;
+		}
+		// Must not be a virtual/row-id column
+		if (col_ids[col_ref.binding.column_index].GetPrimaryIndex() == DConstants::INVALID_INDEX) {
+			return false;
+		}
+	}
+	bool safe = true;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!safe) {
+			return;
+		}
+		if (!IsExpressionSafeForPushdown(child, table_index, col_ids)) {
+			safe = false;
+		}
+	});
+	return safe;
+}
 
 //-----------------------------------------------------------------------------
 // Plan rewriter
@@ -67,13 +111,27 @@ public:
 		const auto projection_index = bound_column_ref.binding.column_index;
 		const auto &projection_expr = projection.expressions[projection_index];
 
-		// The projection must sit on top of a get
-		if (projection.children.size() != 1 || projection.children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+		// The projection must sit on top of a LogicalGet, or on top of a LogicalFilter that
+		// itself sits on top of a LogicalGet (for computed predicate pushdown).
+		if (projection.children.size() != 1) {
 			return false;
 		}
 
-		auto &get_ptr = projection.children.front();
+		LogicalFilter *filter_node = nullptr;
+		if (projection.children.front()->type == LogicalOperatorType::LOGICAL_FILTER) {
+			filter_node = &projection.children.front()->Cast<LogicalFilter>();
+			if (filter_node->children.size() != 1 ||
+			    filter_node->children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+				return false;
+			}
+		} else if (projection.children.front()->type != LogicalOperatorType::LOGICAL_GET) {
+			return false;
+		}
+
+		// get_ptr and get refer to the LogicalGet regardless of whether a LogicalFilter is in between
+		auto &get_ptr = filter_node ? filter_node->children.front() : projection.children.front();
 		auto &get = get_ptr->Cast<LogicalGet>();
+
 		// Check if the get is a table scan
 		if (get.function.name != "seq_scan") {
 			return false;
@@ -82,6 +140,17 @@ public:
 		if (get.dynamic_filters && get.dynamic_filters->HasFilters()) {
 			// Cant push down!
 			return false;
+		}
+
+		// Validate all LogicalFilter expressions BEFORE any plan mutation.
+		// All-or-nothing: if any expression is unsafe, leave the plan untouched.
+		if (filter_node) {
+			auto &col_ids = get.GetColumnIds();
+			for (const auto &filter_expr : filter_node->expressions) {
+				if (!IsExpressionSafeForPushdown(*filter_expr, get.table_index, col_ids)) {
+					return false;
+				}
+			}
 		}
 
 		// We have a top-n operator on top of a table scan
@@ -152,14 +221,15 @@ public:
 			return false;
 		}
 
-		// If there are no table filters pushed down into the get, we can just replace the get with the index scan
+		// Replace the seq_scan function with the HNSW index scan function.
 		const auto cardinality = get.function.cardinality(context, bind_data.get());
 		get.function = HNSWIndexScanFunction::GetFunction();
 		get.has_estimated_cardinality = cardinality->has_estimated_cardinality;
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
-		if (get.table_filters.filters.empty()) {
-			// Remove the TopN operator
+
+		// If there are no filters at all (no table_filters, no LogicalFilter), remove TopN and return.
+		if (get.table_filters.filters.empty() && filter_node == nullptr) {
 			plan = std::move(top_n.children[0]);
 			return true;
 		}
@@ -176,53 +246,163 @@ public:
 		auto &hnsw_bind = get.bind_data->Cast<HNSWIndexScanBindData>();
 
 		if (use_pushdown) {
-			// Push filters into the bind data so the scan builds a FilterBitmap at execution time.
-			// This ensures filtered candidates don't consume the wanted budget in filtered_ef_search.
-			for (const auto &entry : get.table_filters.filters) {
-				hnsw_bind.filter_logical_col_ids.push_back(entry.first);
-				hnsw_bind.filter_storage_col_ids.emplace_back(
-				    hnsw_bind.table.GetColumn(LogicalIndex(entry.first)).StorageOid());
-				hnsw_bind.filter_col_types.push_back(get.returned_types[entry.first]);
-			}
-			hnsw_bind.pushed_filters = get.table_filters.Copy();
-			// Clear from LogicalGet so DuckDB does not create a duplicate LogicalFilter above.
-			get.table_filters.filters.clear();
-		} else {
-			// Escape hatch: fall back to the original post-filter pull-up behavior.
-			// Keep the TopN in the plan so LIMIT/ORDER BY are preserved.
-			get.projection_ids.clear();
-			get.types.clear();
+			// --- Pushdown path ---
 
-			auto new_filter = make_uniq<LogicalFilter>();
-			auto &column_ids = get.GetColumnIds();
-			for (const auto &entry : get.table_filters.filters) {
-				idx_t column_id = entry.first;
-				auto &type = get.returned_types[column_id];
-				bool found = false;
-				for (idx_t i = 0; i < column_ids.size(); i++) {
-					if (column_ids[i].GetPrimaryIndex() == column_id) {
-						column_id = i;
-						found = true;
-						break;
+			// 1. Push table_filters into bind data (zone-map pruning + row-level evaluation)
+			if (!get.table_filters.filters.empty()) {
+				for (const auto &entry : get.table_filters.filters) {
+					hnsw_bind.filter_logical_col_ids.push_back(entry.first);
+					hnsw_bind.filter_storage_col_ids.emplace_back(
+					    hnsw_bind.table.GetColumn(LogicalIndex(entry.first)).StorageOid());
+					hnsw_bind.filter_col_types.push_back(get.returned_types[entry.first]);
+				}
+				hnsw_bind.pushed_filters = get.table_filters.Copy();
+				// Clear from LogicalGet so DuckDB does not create a duplicate LogicalFilter above.
+				get.table_filters.filters.clear();
+			}
+
+			// 2. Push LogicalFilter expressions: remap column refs to scan-chunk positions
+			if (filter_node) {
+				auto &col_ids = get.GetColumnIds();
+				// Map: logical_col_id → position in filter_logical_col_ids (scan chunk position).
+				// Seed with columns already registered from table_filters above.
+				unordered_map<idx_t, idx_t> col_to_scan_pos;
+				for (idx_t i = 0; i < hnsw_bind.filter_logical_col_ids.size(); i++) {
+					col_to_scan_pos[hnsw_bind.filter_logical_col_ids[i]] = i;
+				}
+
+				// Collect all columns referenced in LogicalFilter expressions.
+				// BoundColumnRefExpression.binding.column_index is a projection position;
+				// GetPrimaryIndex() converts it to the logical column ID.
+				for (const auto &expr : filter_node->expressions) {
+					ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+					    *expr, [&](const BoundColumnRefExpression &col_ref) {
+						    idx_t binding_idx    = col_ref.binding.column_index;
+						    idx_t logical_col_id = col_ids[binding_idx].GetPrimaryIndex();
+						    if (col_to_scan_pos.count(logical_col_id)) {
+							    return; // already registered
+						    }
+						    idx_t scan_pos                  = hnsw_bind.filter_logical_col_ids.size();
+						    col_to_scan_pos[logical_col_id] = scan_pos;
+						    hnsw_bind.filter_logical_col_ids.push_back(logical_col_id);
+						    hnsw_bind.filter_storage_col_ids.emplace_back(
+						        hnsw_bind.table.GetColumn(LogicalIndex(logical_col_id)).StorageOid());
+						    hnsw_bind.filter_col_types.push_back(get.returned_types[binding_idx]);
+					    });
+				}
+
+				// Clone each expression and remap: BoundColumnRefExpression → BoundReferenceExpression.
+				// Skip expressions whose column refs are ALL covered by MANDATORY (non-optional)
+				// table_filters.  DuckDB may generate both a mandatory table_filter AND an
+				// equivalent LogicalFilter expression; adding the LogicalFilter would double-push
+				// and cause AND-combination errors.
+				//
+				// IMPORTANT: OptionalFilter (zone-map only, e.g. for id IN (10,50,90)) is NOT
+				// mandatory — the LogicalFilter expression is the authoritative row-level predicate
+				// and must NOT be skipped when the table_filter is OptionalFilter.
+				for (const auto &expr : filter_node->expressions) {
+					bool all_cols_in_mandatory_filters = true;
+					ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+					    *expr, [&](const BoundColumnRefExpression &col_ref) {
+						    if (!all_cols_in_mandatory_filters) {
+							    return;
+						    }
+						    idx_t binding_idx    = col_ref.binding.column_index;
+						    idx_t logical_col_id = col_ids[binding_idx].GetPrimaryIndex();
+						    if (!hnsw_bind.pushed_filters ||
+						        !hnsw_bind.pushed_filters->filters.count(logical_col_id)) {
+							    all_cols_in_mandatory_filters = false;
+							    return;
+						    }
+						    // OptionalFilter is zone-map only; not sufficient for row-level
+						    auto &f = hnsw_bind.pushed_filters->filters.at(logical_col_id);
+						    if (f->filter_type == TableFilterType::OPTIONAL_FILTER) {
+							    all_cols_in_mandatory_filters = false;
+						    }
+					    });
+					if (all_cols_in_mandatory_filters) {
+						continue; // mandatory table_filter handles this; don't double-push
+					}
+
+					auto cloned = expr->Copy();
+					ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+					    cloned,
+					    [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &expr_ptr) {
+						    if (col_ref.binding.table_index != get.table_index) {
+							    return;
+						    }
+						    idx_t logical_col_id = col_ids[col_ref.binding.column_index].GetPrimaryIndex();
+						    auto it              = col_to_scan_pos.find(logical_col_id);
+						    if (it != col_to_scan_pos.end()) {
+							    expr_ptr =
+							        make_uniq<BoundReferenceExpression>(col_ref.return_type, it->second);
+						    }
+					    });
+					hnsw_bind.pushed_filter_expressions.push_back(std::move(cloned));
+				}
+
+				// Remove the LogicalFilter from the plan: promote the LogicalGet up to sit directly
+				// under the Projection (the filter expressions are now in pushed_filter_expressions).
+				projection.children.front() = std::move(filter_node->children.front());
+				filter_node                 = nullptr; // pointer now dangling; clear for safety
+			}
+
+			// Pushdown complete: remove the TopN operator (HNSW scan enforces the limit).
+			plan = std::move(top_n.children[0]);
+			return true;
+		} else {
+			// --- Escape hatch: revert to post-filter behavior ---
+			// Keep the TopN in the plan so LIMIT/ORDER BY are preserved above the filter.
+
+			if (filter_node) {
+				// A LogicalFilter is already in the plan.  Append any table_filter expressions to
+				// it (they also need post-filtering) and leave it in place.
+				auto &column_ids = get.GetColumnIds();
+				for (const auto &entry : get.table_filters.filters) {
+					idx_t logical_col_id = entry.first;
+					auto &type           = get.returned_types[logical_col_id];
+					for (idx_t i = 0; i < column_ids.size(); i++) {
+						if (column_ids[i].GetPrimaryIndex() == logical_col_id) {
+							auto column = make_uniq<BoundColumnRefExpression>(
+							    type, ColumnBinding(get.table_index, i));
+							filter_node->expressions.push_back(entry.second->ToExpression(*column));
+							break;
+						}
 					}
 				}
-				if (!found) {
-					throw InternalException("Could not find column id for filter");
+				filter_node->ResolveOperatorTypes();
+			} else {
+				// No LogicalFilter yet — create one above the LogicalGet.
+				get.projection_ids.clear();
+				get.types.clear();
+
+				auto new_filter  = make_uniq<LogicalFilter>();
+				auto &column_ids = get.GetColumnIds();
+				for (const auto &entry : get.table_filters.filters) {
+					idx_t column_id = entry.first;
+					auto &type      = get.returned_types[column_id];
+					bool found      = false;
+					for (idx_t i = 0; i < column_ids.size(); i++) {
+						if (column_ids[i].GetPrimaryIndex() == column_id) {
+							column_id = i;
+							found     = true;
+							break;
+						}
+					}
+					if (!found) {
+						throw InternalException("Could not find column id for filter");
+					}
+					auto column =
+					    make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
+					new_filter->expressions.push_back(entry.second->ToExpression(*column));
 				}
-				auto column =
-				    make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
-				new_filter->expressions.push_back(entry.second->ToExpression(*column));
+				new_filter->children.push_back(std::move(get_ptr));
+				new_filter->ResolveOperatorTypes();
+				get_ptr = std::move(new_filter);
 			}
-			new_filter->children.push_back(std::move(get_ptr));
-			new_filter->ResolveOperatorTypes();
-			get_ptr = std::move(new_filter);
-			// Don't remove TopN here — the Filter node sits above the scan, TopN stays above everything.
+			// Don't remove TopN — the Filter node sits above the scan; TopN stays above everything.
 			return true;
 		}
-
-		// Pushdown path: remove the TopN operator (HNSW scan already enforces the limit).
-		plan = std::move(top_n.children[0]);
-		return true;
 	}
 
 	static bool OptimizeChildren(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
