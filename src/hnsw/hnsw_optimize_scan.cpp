@@ -159,41 +159,68 @@ public:
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 		if (get.table_filters.filters.empty()) {
-
 			// Remove the TopN operator
 			plan = std::move(top_n.children[0]);
 			return true;
 		}
 
-		// Otherwise, things get more complicated. We need to pullup the filters from the table scan as our index scan
-		// does not support regular filter pushdown.
-		get.projection_ids.clear();
-		get.types.clear();
-
-		auto new_filter = make_uniq<LogicalFilter>();
-		auto &column_ids = get.GetColumnIds();
-		for (const auto &entry : get.table_filters.filters) {
-			idx_t column_id = entry.first;
-			auto &type = get.returned_types[column_id];
-			bool found = false;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
-					column_id = i;
-					found = true;
-					break;
-				}
+		// Check whether filter pushdown into the HNSW scan is enabled
+		Value pushdown_enabled_val;
+		bool use_pushdown = true;
+		if (context.TryGetCurrentSetting("hnsw_enable_filter_pushdown", pushdown_enabled_val)) {
+			if (!pushdown_enabled_val.IsNull()) {
+				use_pushdown = pushdown_enabled_val.GetValue<bool>();
 			}
-			if (!found) {
-				throw InternalException("Could not find column id for filter");
-			}
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
-			new_filter->expressions.push_back(entry.second->ToExpression(*column));
 		}
-		new_filter->children.push_back(std::move(get_ptr));
-		new_filter->ResolveOperatorTypes();
-		get_ptr = std::move(new_filter);
 
-		// Remove the TopN operator
+		auto &hnsw_bind = get.bind_data->Cast<HNSWIndexScanBindData>();
+
+		if (use_pushdown) {
+			// Push filters into the bind data so the scan builds a FilterBitmap at execution time.
+			// This ensures filtered candidates don't consume the wanted budget in filtered_ef_search.
+			for (const auto &entry : get.table_filters.filters) {
+				hnsw_bind.filter_logical_col_ids.push_back(entry.first);
+				hnsw_bind.filter_storage_col_ids.emplace_back(
+				    hnsw_bind.table.GetColumn(LogicalIndex(entry.first)).StorageOid());
+				hnsw_bind.filter_col_types.push_back(get.returned_types[entry.first]);
+			}
+			hnsw_bind.pushed_filters = get.table_filters.Copy();
+			// Clear from LogicalGet so DuckDB does not create a duplicate LogicalFilter above.
+			get.table_filters.filters.clear();
+		} else {
+			// Escape hatch: fall back to the original post-filter pull-up behavior.
+			// Keep the TopN in the plan so LIMIT/ORDER BY are preserved.
+			get.projection_ids.clear();
+			get.types.clear();
+
+			auto new_filter = make_uniq<LogicalFilter>();
+			auto &column_ids = get.GetColumnIds();
+			for (const auto &entry : get.table_filters.filters) {
+				idx_t column_id = entry.first;
+				auto &type = get.returned_types[column_id];
+				bool found = false;
+				for (idx_t i = 0; i < column_ids.size(); i++) {
+					if (column_ids[i].GetPrimaryIndex() == column_id) {
+						column_id = i;
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					throw InternalException("Could not find column id for filter");
+				}
+				auto column =
+				    make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
+				new_filter->expressions.push_back(entry.second->ToExpression(*column));
+			}
+			new_filter->children.push_back(std::move(get_ptr));
+			new_filter->ResolveOperatorTypes();
+			get_ptr = std::move(new_filter);
+			// Don't remove TopN here — the Filter node sits above the scan, TopN stays above everything.
+			return true;
+		}
+
+		// Pushdown path: remove the TopN operator (HNSW scan already enforces the limit).
 		plan = std::move(top_n.children[0]);
 		return true;
 	}
