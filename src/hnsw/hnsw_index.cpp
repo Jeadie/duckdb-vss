@@ -231,6 +231,11 @@ HNSWIndex::HNSWIndex(const string &name, IndexConstraintType index_constraint_ty
 
 		// Is there anything to deserialize? We could have an empty index
 		if (!info.allocator_infos[0].buffer_ids.empty()) {
+			// Reserve with hardware_concurrency threads so load_from_stream captures a non-zero
+			// old_limits.threads() and properly initializes cast_buffer_ and available_threads_.
+			// (In usearch 2.25.0, make() initialises limits to {0,0,0}; load_from_stream uses
+			// old_limits before its internal reset(), so it would otherwise leave both at zero.)
+			index.try_reserve(unum::usearch::index_limits_t {0});
 			LinkedBlockReader reader(*linked_block_allocator, root_block_ptr);
 			index.load_from_stream(
 			    [&](void *data, size_t size) { return size == reader.ReadData(static_cast<data_ptr_t>(data), size); });
@@ -332,14 +337,14 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t 
 
 	// Acquire a shared lock to search the index
 	auto lock = rwlock.GetSharedLock();
-	USearchIndexType::search_result_t search_result;
-	if (bitmap) {
-		search_result = index.filtered_ef_search(
-		    query_vector, limit, [&](row_t key) noexcept { return bitmap->Contains(key); }, ef_search,
-		    index.any_thread());
-	} else {
-		search_result = index.ef_search(query_vector, limit, ef_search);
-	}
+	auto search_result = [&]() -> USearchIndexType::search_result_t {
+		if (bitmap) {
+			return index.filtered_ef_search(
+			    query_vector, limit, [&](row_t key) noexcept { return bitmap->Contains(key); }, ef_search,
+			    index.any_thread());
+		}
+		return index.ef_search(query_vector, limit, ef_search);
+	}();
 
 	state->current_row = 0;
 	state->total_rows = search_result.size();
@@ -396,18 +401,16 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeMultiScan(ClientContext &context
 idx_t HNSWIndex::ExecuteMultiScan(IndexScanState &state_p, float *query_vector, idx_t limit) {
 	auto &state = state_p.Cast<MultiScanState>();
 
-	USearchIndexType::search_result_t search_result;
-	{
-		auto lock = rwlock.GetSharedLock();
+	auto lock = rwlock.GetSharedLock();
+	auto search_result = [&]() -> USearchIndexType::search_result_t {
 		if (state.filter_bitmap) {
 			const auto *bm = state.filter_bitmap;
-			search_result = index.filtered_ef_search(
+			return index.filtered_ef_search(
 			    query_vector, limit, [&](row_t key) noexcept { return bm->Contains(key); }, state.ef_search,
 			    index.any_thread());
-		} else {
-			search_result = index.ef_search(query_vector, limit, state.ef_search);
 		}
-	}
+		return index.ef_search(query_vector, limit, state.ef_search);
+	}();
 
 	const auto offset = state.row_ids.size();
 	state.row_ids.resize(state.row_ids.size() + search_result.size());
