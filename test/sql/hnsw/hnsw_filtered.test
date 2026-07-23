@@ -77,17 +77,16 @@ physical_plan	<!REGEX>:.*SEMI.*
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 3. Equality filter — all returned rows must have label='A'.
-#    Approximate filtered search may return fewer than LIMIT.
 # ───────────────────────────────────────────────────────────────────────────────
 
-# At least 1 result returned
+# Exactly LIMIT results returned (early-termination bug fixed in usearch 2.17.8)
 query I
-SELECT count(*) >= 1 FROM (
+SELECT count(*) FROM (
     SELECT id FROM flt WHERE label = 'A'
     ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
 );
 ----
-true
+5
 
 # Verify all returned rows actually satisfy the filter
 query I
@@ -103,12 +102,12 @@ SELECT count(*) FROM (
 # ───────────────────────────────────────────────────────────────────────────────
 
 query I
-SELECT count(*) >= 1 FROM (
+SELECT count(*) FROM (
     SELECT id FROM flt WHERE id >= 50
     ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
 );
 ----
-true
+5
 
 query I
 SELECT count(*) FROM (
@@ -123,25 +122,25 @@ SELECT count(*) FROM (
 # ───────────────────────────────────────────────────────────────────────────────
 
 query I
-SELECT count(*) >= 1 FROM (
+SELECT count(*) FROM (
     SELECT id FROM flt WHERE label IS NOT NULL
     ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 5
 );
 ----
-true
+5
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 6. Highly selective filter: only 3 rows match, LIMIT=10.
-#    Must return at most 3, and all must satisfy the predicate.
+#    Must return exactly 3 (all matching rows, no more).
 # ───────────────────────────────────────────────────────────────────────────────
 
 query I
-SELECT count(*) <= 3 FROM (
+SELECT count(*) FROM (
     SELECT id FROM flt WHERE id IN (10, 50, 90)
     ORDER BY array_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 10
 );
 ----
-true
+3
 
 # All returned rows must be in the allowed set
 query I
